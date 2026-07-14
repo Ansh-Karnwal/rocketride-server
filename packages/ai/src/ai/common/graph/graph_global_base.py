@@ -168,7 +168,13 @@ class GraphGlobalBase(IGlobalBase, ABC):
 
         self._open_driver(config)
 
-        self.graph_schema = self._reflect_schema()
+        # Reflection is a convenience for the LLM prompt, not a prerequisite for a
+        # working connection — a driver bug here must not take down a live node.
+        try:
+            self.graph_schema = self._reflect_schema()
+        except Exception as e:
+            warning(f'{self.glb.logicalType}: schema reflection failed, continuing without it: {e}')
+            self.graph_schema = {'nodes': {}, 'relationships': []}
         labels = len(self.graph_schema.get('nodes', {}))
         rels = len(self.graph_schema.get('relationships', []))
         debug(f'{self.glb.logicalType}: connected; schema has {labels} label(s), {rels} relationship type(s)')

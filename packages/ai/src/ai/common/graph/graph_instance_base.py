@@ -102,6 +102,7 @@ class GraphInstanceBase(IInstanceBase, ABC):
                 'rows': {'type': 'array', 'items': {'type': 'object'}},
                 'query': {'type': 'string', 'description': 'The generated read-only query that was executed.'},
                 'row_limit': {'type': 'integer'},
+                'truncated': {'type': 'boolean', 'description': 'True if rows were cut at the row limit.'},
                 'valid': {'type': 'boolean'},
                 'error': {'type': 'string'},
                 'answer': {
@@ -138,11 +139,15 @@ class GraphInstanceBase(IInstanceBase, ABC):
         except Exception as e:
             return {'valid': False, 'error': str(e), 'query': query, 'rows': []}
 
+        # Enforce the limit here too: the LLM is told to add a LIMIT clause, but a
+        # dropped or ignored clause must not stream an unbounded result to the caller.
+        capped = rows[:limit]
         return {
             'valid': True,
-            'rows': [self._sanitize_row(row) for row in rows],
+            'rows': [self._sanitize_row(row) for row in capped],
             'query': query,
             'row_limit': limit,
+            'truncated': len(rows) > limit,
         }
 
     @tool_function(
@@ -213,7 +218,11 @@ class GraphInstanceBase(IInstanceBase, ABC):
 
         query = result.get('query', '')
         if not parse_is_valid(result.get('isValid', False)) or not query:
-            # The LLM decided this wasn't a graph question — pass its prose through.
+            # An error means the query was built but kept failing EXPLAIN — surface
+            # it as an error, not as a prose answer holding broken Cypher.
+            if result.get('error'):
+                return {'error': result['error'], 'query': query, 'valid': False}
+            # Otherwise the LLM decided this wasn't a graph question — pass its prose through.
             return {'answer': query, 'valid': False}
         if not is_cypher_safe(query):
             return {'error': 'Generated query contains write or admin clauses', 'query': query, 'valid': False}
@@ -344,8 +353,13 @@ class GraphInstanceBase(IInstanceBase, ABC):
             last_error = explain_error
 
         warning(
-            f'Query validation failed after {self.IGlobal.max_validation_attempts} attempt(s); returning last result.'
+            f'Query validation failed after {self.IGlobal.max_validation_attempts} attempt(s); rejecting the query.'
         )
+        # Every EXPLAIN attempt failed. Force isValid false so callers do not run
+        # a query the database already rejected; keep the last query for context
+        # and the error so callers can tell this apart from a non-graph question.
+        result['isValid'] = False
+        result['error'] = last_error or 'Query validation failed'
         return result
 
     def _buildQueryOnce(

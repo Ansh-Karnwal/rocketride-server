@@ -469,3 +469,88 @@ def test_parse_is_valid_accepts_bool_and_string():
     assert graph_base.parse_is_valid('true') is True
     assert graph_base.parse_is_valid('false') is False
     assert graph_base.parse_is_valid(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Fixes from PR review: enforce limit, reject on EXPLAIN exhaustion, count writes
+# ---------------------------------------------------------------------------
+
+
+def test_get_data_enforces_limit_when_llm_drops_it():
+    """The LLM may omit LIMIT; get_data must still cap rows and flag truncation."""
+    rows = [{'n': i} for i in range(10)]
+    graph = _FakeGraph(_FakeResult(result_set=[[r['n']] for r in rows], header=[[1, 'n']]))
+    inst = _instance(_FakeGlobal(graph))
+    # Bypass the LLM: force a valid query with a small limit.
+    inst.get_query = lambda args: {'query': 'MATCH (n) RETURN n', 'valid': True}
+
+    out = inst.get_data({'question': 'all nodes', 'limit': 3})
+
+    assert out['valid'] is True
+    assert len(out['rows']) == 3
+    assert out['truncated'] is True
+
+
+def test_build_query_marks_invalid_after_explain_exhaustion():
+    """A query EXPLAIN keeps rejecting must not come back as valid."""
+    graph = _FakeGraph(raise_error=mod.RedisError('syntax error'))  # explain always fails
+    glb = _FakeGlobal(graph)
+    glb.max_validation_attempts = 2
+    inst = _instance(glb)
+    # Bypass the LLM: it keeps returning the same (syntactically valid, read-only) query.
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': 'MATCH (n) RETURN n'}
+
+    result = inst._buildQuery('anything')
+
+    assert graph_base.parse_is_valid(result.get('isValid')) is False
+    assert result.get('error')  # the EXPLAIN error is carried for the caller
+
+
+def test_get_query_surfaces_explain_failure_as_error_not_prose():
+    """An EXPLAIN-exhausted query must return an error, not the broken query as prose."""
+    graph = _FakeGraph(raise_error=mod.RedisError('syntax error'))
+    glb = _FakeGlobal(graph)
+    glb.max_validation_attempts = 2
+    inst = _instance(glb)
+    inst._buildQueryOnce = lambda *a, **k: {'isValid': True, 'query': 'MATCH (n RETURN n'}
+
+    out = inst.get_query({'question': 'broken'})
+
+    assert out['valid'] is False
+    assert out.get('error')  # not swallowed into an 'answer' field
+    assert 'answer' not in out
+
+
+def test_affected_rows_counts_all_write_counters():
+    """_affected_rows must not undercount vs the query tool's _write_stats."""
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], labels_added=3, properties_removed=2))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+
+    out = glb._run_query_raw('MATCH (n) REMOVE n:Tmp')
+
+    assert out['affected_rows'] == 5  # 3 labels_added + 2 properties_removed
+
+
+def test_affected_rows_reported_for_write_that_also_returns_rows():
+    """CREATE (n) RETURN n writes AND returns rows — affected_rows must not be 0."""
+    graph = _FakeGraph(_FakeResult(result_set=[['Alice']], header=[[1, 'n']], nodes_created=1, properties_set=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+
+    out = glb._run_query_raw('CREATE (n:Person {name: "Alice"}) RETURN n')
+
+    assert out['rows']  # the RETURN produced a row
+    assert out['affected_rows'] == 2  # ...and the write is still counted
+
+
+def test_reflect_schema_failure_does_not_break_begin(monkeypatch):
+    """A driver error during reflection degrades the schema, it does not crash the node."""
+    glb = _FakeGlobal(_FakeGraph())
+    monkeypatch.setattr(glb, '_reflect_schema', lambda: (_ for _ in ()).throw(RuntimeError('boom')))
+    monkeypatch.setattr(glb, '_open_driver', lambda config: None)
+    glb.glb = types.SimpleNamespace(logicalType='graph_falkordb', connConfig={})
+
+    graph_base.GraphGlobalBase.beginGlobal(glb)
+
+    assert glb.graph_schema == {'nodes': {}, 'relationships': []}

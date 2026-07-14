@@ -54,6 +54,8 @@ DEFAULT_ROW_CAP = 250
 SCHEMA_SAMPLE_SIZE = 1
 # Cap on distinct relationship patterns pulled during reflection.
 SCHEMA_REL_LIMIT = 100
+# Cap on labels sampled during reflection — one query per label, so bound the fan-out.
+SCHEMA_LABEL_LIMIT = 200
 
 
 class IGlobal(GraphGlobalBase):
@@ -137,7 +139,10 @@ class IGlobal(GraphGlobalBase):
         if len(rows) > max_rows:
             raise ValueError(f'EXECUTE query exceeded max_execute_rows={max_rows}')
 
-        return {'rows': rows, 'affected_rows': 0 if rows else _affected_rows(result)}
+        # Count writes unconditionally: unlike SQL, a Cypher write commonly also
+        # returns rows (CREATE (n) RETURN n), so `rows` being non-empty does not
+        # mean nothing was written. _affected_rows is 0 for a pure read anyway.
+        return {'rows': rows, 'affected_rows': _affected_rows(result)}
 
     def _validate_query(self, query: str) -> Tuple[bool, str]:
         """Check syntax with EXPLAIN without running the query."""
@@ -156,7 +161,8 @@ class IGlobal(GraphGlobalBase):
         try:
             graph = self.select_graph()
 
-            for label in self._column(graph, 'CALL db.labels()'):
+            # One sampling query per label, so bound the fan-out on a wide schema.
+            for label in self._column(graph, 'CALL db.labels()')[:SCHEMA_LABEL_LIMIT]:
                 schema['nodes'][label] = self._sample_properties(graph, label)
 
             result = graph.ro_query(
@@ -284,6 +290,9 @@ def _affected_rows(result) -> int:
         'relationships_created',
         'relationships_deleted',
         'properties_set',
+        'properties_removed',
+        'labels_added',
+        'indices_created',
     ):
         try:
             total += int(getattr(result, attr, 0) or 0)
