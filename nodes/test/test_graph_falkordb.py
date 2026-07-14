@@ -23,83 +23,175 @@
 # SOFTWARE.
 # =============================================================================
 
-"""Unit tests for tool_falkordb helpers and tool-method behavior (no server)."""
+"""Tests for the FalkorDB graph node.
+
+The node derives from ``ai.common.graph``, so the real base classes are loaded
+from disk (as ``ai.common.graph``) with ``rocketlib`` and the heavier ``ai``
+modules stubbed, mirroring ``test_vectordb_tool_mixin.py``.
+"""
 
 from __future__ import annotations
 
 import datetime
-import importlib
+import importlib.util
 import sys
+import types
+
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import Iterator
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Bootstrap: when run under a bare interpreter that lacks the engine runtime
-# (rocketlib, ai.common, falkordb, redis), inject lightweight stubs ONLY for
-# modules that are not already present, import the module under test, then
-# REMOVE the stubs we added so they never leak into the shared pytest session
-# (see test_tool_tavily.py for the full rationale).
-# ---------------------------------------------------------------------------
-
-_NODES_SRC = Path(__file__).resolve().parents[1] / 'src'
-if str(_NODES_SRC) not in sys.path:
-    sys.path.insert(0, str(_NODES_SRC))
+_REPO = Path(__file__).resolve().parents[2]
+_GRAPH_PKG = _REPO / 'packages' / 'ai' / 'src' / 'ai' / 'common' / 'graph'
+_CONFIG_UTILS = _REPO / 'packages' / 'ai' / 'src' / 'ai' / 'common' / 'utils' / 'config_utils.py'
+_NODE_DIR = _REPO / 'nodes' / 'src' / 'nodes' / 'graph_falkordb'
 
 
 class _StubRedisError(Exception):
-    """Real exception class so IInstance's except clauses catch it under the stub."""
+    pass
 
 
-def _build_import_stubs():
-    """Return {module_name: stub} for the deps needed only to import the module."""
-    rocketlib = MagicMock()
-    rocketlib.IInstanceBase = object
-    rocketlib.IGlobalBase = object
+class _StubBase:
+    """Stand-in for IInstanceBase / IGlobalBase — the engine supplies the real one."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+class _StubTable:
+    @staticmethod
+    def generate_markdown_table(data, headers=None):
+        return '\n'.join([' | '.join(map(str, row)) for row in data])
+
+
+_STUB_NAMES = (
+    'rocketlib',
+    'rocketlib.types',
+    'ai',
+    'ai.common',
+    'ai.common.schema',
+    'ai.common.table',
+    'ai.common.config',
+    'ai.common.utils',
+    'falkordb',
+    'redis',
+    'redis.exceptions',
+)
+
+
+def _install_stubs() -> None:
+    rocketlib = types.ModuleType('rocketlib')
+    rocketlib.IInstanceBase = _StubBase
+    rocketlib.IGlobalBase = _StubBase
+    # The decorator only tags the function in production; here it must be a no-op
+    # so the methods stay directly callable.
     rocketlib.tool_function = lambda **kwargs: lambda f: f
     rocketlib.debug = lambda *a, **kw: None
     rocketlib.error = lambda *a, **kw: None
     rocketlib.warning = lambda *a, **kw: None
-    rocketlib.OPEN_MODE = MagicMock()
+    rocketlib.OPEN_MODE = types.SimpleNamespace(CONFIG=object())
+    rocketlib_types = types.ModuleType('rocketlib.types')
+    rocketlib_types.IInvokeLLM = types.SimpleNamespace(Ask=lambda **kw: kw)
+    rocketlib.types = rocketlib_types
 
-    depends = MagicMock()
-    depends.depends = lambda *a, **kw: None
+    ai_pkg = types.ModuleType('ai')
+    ai_pkg.__path__ = []
+    common_pkg = types.ModuleType('ai.common')
+    common_pkg.__path__ = []
 
-    ai_common_utils = MagicMock()
-    ai_common_utils.normalize_tool_input = lambda args, **kw: args if isinstance(args, dict) else {}
+    schema = types.ModuleType('ai.common.schema')
+    schema.Answer = type('Answer', (), {'setAnswer': lambda self, v: setattr(self, 'value', v)})
+    schema.Question = type('Question', (), {})
+    schema.QuestionType = types.SimpleNamespace(QUESTION=1, DIALECT=2, EXECUTE=3)
 
-    falkordb = MagicMock()
-    falkordb.FalkorDB = MagicMock()
+    table = types.ModuleType('ai.common.table')
+    table.Table = _StubTable
 
-    redis_exceptions = MagicMock()
+    config = types.ModuleType('ai.common.config')
+    config.Config = types.SimpleNamespace(getNodeConfig=lambda *a, **kw: {})
+
+    # Load the real config parsers rather than reimplementing them, so the node
+    # is exercised against the same coercion rules it uses in production.
+    config_utils = _load_from_path('ai.common.config_utils', _CONFIG_UTILS)
+    utils = types.ModuleType('ai.common.utils')
+    utils.normalize_tool_input = lambda args, **kw: args if isinstance(args, dict) else {}
+    utils.parse_bool = config_utils.parse_bool
+    utils.config_int = config_utils.config_int
+
+    falkordb = types.ModuleType('falkordb')
+    falkordb.FalkorDB = object
+
+    redis_exceptions = types.ModuleType('redis.exceptions')
     redis_exceptions.RedisError = _StubRedisError
-    redis = MagicMock()
+    redis = types.ModuleType('redis')
     redis.exceptions = redis_exceptions
 
-    return {
-        'rocketlib': rocketlib,
-        'depends': depends,
-        'ai': MagicMock(),
-        'ai.common': MagicMock(),
-        'ai.common.utils': ai_common_utils,
-        'ai.common.config': MagicMock(),
-        'falkordb': falkordb,
-        'redis': redis,
-        'redis.exceptions': redis_exceptions,
-    }
+    sys.modules.update(
+        {
+            'rocketlib': rocketlib,
+            'rocketlib.types': rocketlib_types,
+            'ai': ai_pkg,
+            'ai.common': common_pkg,
+            'ai.common.schema': schema,
+            'ai.common.table': table,
+            'ai.common.config': config,
+            'ai.common.utils': utils,
+            'falkordb': falkordb,
+            'redis': redis,
+            'redis.exceptions': redis_exceptions,
+        }
+    )
 
 
-_added_stubs = []
-for _name, _stub in _build_import_stubs().items():
-    if _name not in sys.modules:
-        sys.modules[_name] = _stub
-        _added_stubs.append(_name)
+@contextmanager
+def _scoped_stubs() -> Iterator[None]:
+    saved = {name: sys.modules.get(name) for name in _STUB_NAMES}
+    _install_stubs()
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
-mod = importlib.import_module('nodes.tool_falkordb.IInstance')
 
-for _name in _added_stubs:
-    sys.modules.pop(_name, None)
+def _load_from_path(name: str, path: Path, *, is_package: bool = False):
+    """Load a module by file path and register it under ``name``."""
+    search = [str(path.parent)] if is_package else None
+    spec = importlib.util.spec_from_file_location(name, path, submodule_search_locations=search)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_node():
+    """Load the real graph base classes, then the FalkorDB node on top of them."""
+    with _scoped_stubs():
+        _load_from_path('ai.common.graph', _GRAPH_PKG / '__init__.py', is_package=True)
+        iglobal = _load_from_path('nodes.graph_falkordb.IGlobal', _NODE_DIR / 'IGlobal.py')
+        # IInstance does `from .IGlobal import ...`, so its package must resolve.
+        pkg = types.ModuleType('nodes.graph_falkordb')
+        pkg.__path__ = [str(_NODE_DIR)]
+        pkg.IGlobal = iglobal
+        sys.modules['nodes.graph_falkordb'] = pkg
+        iinstance = _load_from_path('nodes.graph_falkordb.IInstance', _NODE_DIR / 'IInstance.py')
+        return iglobal, iinstance
+
+
+_glb_mod, mod = _load_node()
+graph_base = sys.modules['ai.common.graph']
+config_utils = sys.modules['ai.common.config_utils']
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
 
 
 class _FakeNode:
@@ -153,6 +245,12 @@ class _FakeGraph:
             raise self._raise
         return self._result
 
+    def explain(self, q):
+        self.calls.append(('explain', q, None, None))
+        if self._raise:
+            raise self._raise
+        return 'plan'
+
 
 class _FakeClient:
     def __init__(self, graph):
@@ -167,13 +265,20 @@ class _FakeClient:
         return ['g1', 'g2']
 
 
-class _FakeGlobal:
-    def __init__(self, graph, *, allow_writes=False, max_rows=250, graph_name='agent'):
+class _FakeGlobal(_glb_mod.IGlobal):
+    """The real IGlobal with a fake client — exercises select_graph/_run_query for real."""
+
+    def __init__(self, graph, *, allow_writes=False, max_rows=250, graph_name='agent', graph_schema=None):
         self.client = _FakeClient(graph)
         self.allow_writes = allow_writes
         self.max_rows = max_rows
         self.graph_name = graph_name
         self.query_timeout_ms = 30000
+        self.max_execute_rows = 25000
+        self.max_validation_attempts = 5
+        self.allow_execute = False
+        self.db_description = ''
+        self.graph_schema = graph_schema or {'nodes': {}, 'relationships': []}
 
 
 def _instance(global_state):
@@ -238,17 +343,13 @@ def test_query_caps_rows_and_flags_truncation():
 
 def test_query_rejects_bad_params_without_touching_client():
     graph = _FakeGraph()
-    glb = _FakeGlobal(graph)
-    inst = _instance(glb)
+    inst = _instance(_FakeGlobal(graph))
     with pytest.raises(ValueError):
         inst.query({'cypher': 'MATCH (n) RETURN n', 'params': 'not-a-dict'})
     assert graph.calls == []
 
 
 def test_query_returns_error_dict_on_redis_error():
-    # Raise the class the module actually bound — under `builder nodes:test-full`
-    # the real redis may already be imported, and the file-local stub would
-    # then not be caught by IInstance's `except RedisError`.
     graph = _FakeGraph(raise_error=mod.RedisError('bad cypher'))
     inst = _instance(_FakeGlobal(graph))
     out = inst.query({'cypher': 'MATCH (n) RETURN n'})
@@ -265,20 +366,106 @@ def test_query_graph_override_and_default():
     assert glb.client.selected == ['default-graph', 'other']
 
 
-# ---------------------------------------------------------------------------
-# list_graphs / get_schema
-# ---------------------------------------------------------------------------
-
-
 def test_list_graphs_returns_names():
     inst = _instance(_FakeGlobal(_FakeGraph()))
     assert inst.list_graphs({}) == {'graphs': ['g1', 'g2']}
 
 
-def test_get_schema_shapes_columns():
-    graph = _FakeGraph(_FakeResult(result_set=[['Person'], ['City']], header=[[1, 'label']]))
-    inst = _instance(_FakeGlobal(graph))
+# ---------------------------------------------------------------------------
+# Inherited graph base: schema, dialect, read-only enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_get_schema_comes_from_reflected_schema():
+    schema = {
+        'nodes': {'Person': [('name', 'STRING')]},
+        'relationships': [{'type': 'KNOWS', 'start': 'Person', 'end': 'Person'}],
+    }
+    inst = _instance(_FakeGlobal(_FakeGraph(), graph_schema=schema))
     out = inst.get_schema({})
-    assert out['labels'] == ['Person', 'City']
-    # All three procedures run read-only.
-    assert all(call[0] == 'ro_query' for call in graph.calls)
+    assert out['labels'] == ['Person']
+    assert out['nodes'] == {'Person': [{'property': 'name', 'type': 'STRING'}]}
+    assert out['relationships'] == schema['relationships']
+
+
+def test_dialect_identifies_falkordb():
+    inst = _instance(_FakeGlobal(_FakeGraph()))
+    assert inst.dialect({}) == {'dialect': 'falkordb'}
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [(True, True), ('true', True), ('yes', True), ('on', True), ('false', False), ('off', False), ('no', False)],
+)
+def test_allow_writes_accepts_human_typed_strings(raw, expected):
+    """allow_writes is human-edited config: 'false' must not read as truthy."""
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[]))
+    glb = _FakeGlobal(graph)
+    glb.allow_writes = config_utils.parse_bool(raw)
+
+    _instance(glb).query({'cypher': 'MATCH (n) RETURN n'})
+
+    # Writes enabled -> GRAPH.QUERY; disabled -> GRAPH.RO_QUERY (server refuses writes).
+    assert graph.calls[0][0] == ('query' if expected else 'ro_query')
+
+
+def test_run_query_uses_server_side_readonly():
+    """_run_query must go through ro_query so the server rejects writes."""
+    graph = _FakeGraph(_FakeResult(result_set=[['Alice']], header=[[1, 'name']]))
+    glb = _FakeGlobal(graph)
+    rows = glb._run_query('MATCH (n) RETURN n.name AS name')
+    assert graph.calls[0][0] == 'ro_query'
+    assert rows == [{'name': 'Alice'}]
+
+
+def test_execute_tool_is_disabled_unless_allowed():
+    inst = _instance(_FakeGlobal(_FakeGraph()))
+    with pytest.raises(ValueError, match='allow_execute'):
+        inst.execute({'query': 'CREATE (n:Person)'})
+
+
+def test_execute_tool_runs_writes_when_allowed():
+    graph = _FakeGraph(_FakeResult(result_set=[], header=[], nodes_created=1))
+    glb = _FakeGlobal(graph)
+    glb.allow_execute = True
+    out = _instance(glb).execute({'query': 'CREATE (n:Person)'})
+    assert graph.calls[0][0] == 'query'
+    assert out['affected_rows'] == 1
+
+
+def test_validate_query_uses_explain():
+    graph = _FakeGraph()
+    ok, err = _FakeGlobal(graph)._validate_query('MATCH (n) RETURN n')
+    assert ok is True and err == ''
+    assert graph.calls[0][0] == 'explain'
+
+
+# ---------------------------------------------------------------------------
+# Cypher safety (shared by every graph node)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'cypher',
+    [
+        'CREATE (n:Person)',
+        'MATCH (n) DELETE n',
+        'MATCH (n) SET n.x = 1',
+        'MERGE (n:Person {name: "a"})',
+    ],
+)
+def test_is_cypher_safe_rejects_writes(cypher):
+    assert graph_base.is_cypher_safe(cypher) is False
+
+
+def test_is_cypher_safe_allows_reads_and_ignores_comments():
+    assert graph_base.is_cypher_safe('MATCH (n) RETURN n') is True
+    # A commented-out write must not make the statement look unsafe...
+    assert graph_base.is_cypher_safe('MATCH (n) RETURN n // CREATE (x)') is True
+
+
+def test_parse_is_valid_accepts_bool_and_string():
+    assert graph_base.parse_is_valid(True) is True
+    assert graph_base.parse_is_valid('true') is True
+    assert graph_base.parse_is_valid('false') is False
+    assert graph_base.parse_is_valid(None) is False
