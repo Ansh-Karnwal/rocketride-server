@@ -860,7 +860,9 @@ class DataConn(DAPConn):
         # tool traffic from saturating the endpoint beyond threadCount.
         borrowed = conn_pipe is None
         if borrowed:
-            await self._pipe_sem.acquire()
+            # Standalone tool calls open no pipe, so lazy-init the semaphore here.
+            pipe_sem = await self._ensure_pipe_sem()
+            await pipe_sem.acquire()
 
         def tool_sync():
             # Use caller's open pipe if provided, otherwise borrow one
