@@ -65,6 +65,12 @@ TEST_CASE("crypto::base64") {
         REQUIRE_VALUE(crypto::base64Decode("Zm8"_tv), "fo"_tv);
     }
 
+    SUBSECTION("Decodes a single leftover character to nothing") {
+        // A lone trailing character cannot encode a full byte, so the tail
+        // loop emits zero bytes (j < i - 1 with i == 1 runs no iterations).
+        REQUIRE(crypto::base64Decode("Z"_tv)->empty());
+    }
+
     SUBSECTION("Whitespace or invalid bytes terminate decoding") {
         // Decoding stops at the first byte outside the alphabet (the padding
         // character, whitespace, or anything else), so only the leading valid

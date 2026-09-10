@@ -94,7 +94,7 @@ inline ErrorOr<Buffer> base64Decode(TextView input) noexcept {
     if (!input) return Buffer{};
 
     int i = 0, j = 0;
-    unsigned char chr4[4], chr3[3];
+    unsigned char chr4[4]{}, chr3[3]{};
 
     StackTextArena arena;
     StackText result{arena};
